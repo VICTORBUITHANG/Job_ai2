@@ -1,0 +1,16 @@
+{
+  "email": "tech.victorbui@gmail.com",
+  "created_at": "2026-07-08T17:33:39.371042+00:00",
+  "updated_at": "2026-07-08T17:35:17.192142+00:00",
+  "completed_sections": true,
+  "fields": {
+    "disability_status": "No, I do not have a disability and have not had one in the past",
+    "self_identify_gender": "Male",
+    "work_authorization": "Yes",
+    "desired_start_date": "10/10/2026",
+    "ethnicity": "Not Hispanic or Latino",
+    "gender": "Male",
+    "visa_sponsorship": "No",
+    "veteran_status": "I am not a protected veteran"
+  }
+}

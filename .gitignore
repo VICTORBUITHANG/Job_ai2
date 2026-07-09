@@ -1,0 +1,9 @@
+# File: /Users/victorbui/AI/Job_ai2/.gitignore
+.env
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+artifacts/uploads/
+artifacts/reviews/
+artifacts/screenshots/

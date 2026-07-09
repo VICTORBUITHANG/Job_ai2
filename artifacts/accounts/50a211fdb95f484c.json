@@ -1,0 +1,16 @@
+{
+  "email": "osman.sorkhabi@lamresearch.com",
+  "created_at": "2026-07-09T13:25:15.734674+00:00",
+  "updated_at": "2026-07-09T13:25:40.391578+00:00",
+  "completed_sections": true,
+  "fields": {
+    "work_authorization": "Yes",
+    "disability_status": "No, I do not have a disability and have not had one in the past",
+    "desired_start_date": "10/10/2026",
+    "veteran_status": "I am not a protected veteran",
+    "ethnicity": "Not Hispanic or Latino",
+    "visa_sponsorship": "No",
+    "self_identify_gender": "Male",
+    "gender": "Male"
+  }
+}
