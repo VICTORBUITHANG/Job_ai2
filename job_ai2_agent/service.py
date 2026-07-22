@@ -1,5 +1,4 @@
-# File: /Users/victorbui/AI/Job_ai2/job_ai2_agent/service.py
-from __future__ import annotations
+# job_ai2_agent/service.py
 
 import json
 from dataclasses import asdict
@@ -9,7 +8,7 @@ from pathlib import Path
 from job_ai2_agent.browser_agent import fill_job_application
 from job_ai2_agent.config import Settings
 from job_ai2_agent.llm_mapper import FieldMapper
-from job_ai2_agent.models import AgentRunResult
+from job_ai2_agent.models import AgentRunResult, EducationItem, WorkExperience
 from job_ai2_agent.resume_reader import read_resume_profile
 
 
@@ -34,6 +33,7 @@ class JobApplicationAgent:
             for key, value in overrides.items():
                 if value.strip():
                     profile.fields[key] = value.strip()
+            _apply_structured_overrides(profile, overrides)
         mapper = FieldMapper(
             api_key=self.settings.openai_api_key,
             model=self.settings.openai_model,
@@ -73,3 +73,52 @@ class JobApplicationAgent:
         if latest_error.exists():
             latest_error.unlink()
         return result
+
+
+def _apply_structured_overrides(profile, overrides):
+    work_experiences = []
+    for index in range(6):
+        prefix = f"work_{index}_"
+        title = overrides.get(f"{prefix}title", "").strip()
+        company = overrides.get(f"{prefix}company", "").strip()
+        if not title and not company:
+            continue
+        work_experiences.append(
+            WorkExperience(
+                title=title,
+                company=company,
+                location=overrides.get(f"{prefix}location", "").strip(),
+                start_month=overrides.get(f"{prefix}start_month", "").strip(),
+                start_year=overrides.get(f"{prefix}start_year", "").strip(),
+                end_month=overrides.get(f"{prefix}end_month", "").strip(),
+                end_year=overrides.get(f"{prefix}end_year", "").strip(),
+                currently_work_here=overrides.get(f"{prefix}currently_work_here", "").strip().lower() == "yes",
+                description=overrides.get(f"{prefix}description", "").strip(),
+            )
+        )
+    if work_experiences:
+        profile.work_experiences = work_experiences
+        current = work_experiences[0]
+        profile.fields["current_job_title"] = current.title
+        profile.fields["current_company"] = current.company
+        profile.fields["current_job_location"] = current.location
+        profile.fields["current_job_start_month"] = current.start_month
+        profile.fields["current_job_start_year"] = current.start_year
+
+    education_items = []
+    for index in range(4):
+        prefix = f"education_{index}_"
+        school = overrides.get(f"{prefix}school", "").strip()
+        degree = overrides.get(f"{prefix}degree", "").strip()
+        if not school and not degree:
+            continue
+        education_items.append(
+            EducationItem(
+                school=school,
+                degree=degree,
+                field_of_study=overrides.get(f"{prefix}field", "").strip(),
+                end_year=overrides.get(f"{prefix}end_year", "").strip(),
+            )
+        )
+    if education_items:
+        profile.education_items = education_items

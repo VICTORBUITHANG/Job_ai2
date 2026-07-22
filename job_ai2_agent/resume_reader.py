@@ -1,5 +1,4 @@
-# File: /Users/victorbui/AI/Job_ai2/job_ai2_agent/resume_reader.py
-from __future__ import annotations
+# job_ai2_agent/resume_reader.py
 
 import re
 from pathlib import Path
@@ -13,7 +12,27 @@ URL_RE = re.compile(r"https?://[^\s)]+|(?:linkedin|github)\.com/[^\s)]+", re.IGN
 
 
 def read_resume_profile(path: Path) -> ResumeProfile:
-    text = extract_resume_text(path)
+    suffix = path.suffix.lower()
+    if suffix == ".docx":
+        return read_docx_resume_profile(path)
+    if suffix == ".pdf":
+        return read_pdf_resume_profile(path)
+    raise ValueError("Resume must be a PDF or DOCX file.")
+
+
+def read_docx_resume_profile(path):
+    if path.suffix.lower() != ".docx":
+        raise ValueError("DOCX resume parser only accepts .docx files.")
+    return _profile_from_text(_read_docx(path))
+
+
+def read_pdf_resume_profile(path):
+    if path.suffix.lower() != ".pdf":
+        raise ValueError("PDF resume parser only accepts .pdf files.")
+    return _profile_from_text(_read_pdf(path))
+
+
+def _profile_from_text(text):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     fields = infer_basic_profile(text)
     work_experiences = infer_work_experiences(lines)
@@ -33,10 +52,22 @@ def read_resume_profile(path: Path) -> ResumeProfile:
 def extract_resume_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return _read_pdf(path)
+        return extract_pdf_resume_text(path)
     if suffix == ".docx":
-        return _read_docx(path)
+        return extract_docx_resume_text(path)
     raise ValueError("Resume must be a PDF or DOCX file.")
+
+
+def extract_docx_resume_text(path):
+    if path.suffix.lower() != ".docx":
+        raise ValueError("DOCX text extractor only accepts .docx files.")
+    return _read_docx(path)
+
+
+def extract_pdf_resume_text(path):
+    if path.suffix.lower() != ".pdf":
+        raise ValueError("PDF text extractor only accepts .pdf files.")
+    return _read_pdf(path)
 
 
 def infer_basic_profile(text: str) -> dict[str, str]:
@@ -49,6 +80,7 @@ def infer_basic_profile(text: str) -> dict[str, str]:
     current_job = _guess_current_job(lines)
     top_education = _guess_top_education(lines)
     profile: dict[str, str] = {
+        "legal_name": full_name,
         "full_name": full_name,
         "first_name": first_name,
         "last_name": last_name,
@@ -192,7 +224,7 @@ def _find_work_date_range(line: str) -> tuple[int, str, str, str, str] | None:
     month_name = r"Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December"
     separator = r"\s*(?:[–—-]|\bto\b)\s*"
     patterns = [
-        rf"(?P<sm>\d{{1,2}})\s*/\s*(?P<sy>19\d{{2}}|20\d{{2}}){separator}(?P<em>\d{{1,2}})\s*/\s*(?P<ey>19\d{{2}}|20\d{{2}}|present|current)\b",
+        rf"(?P<sm>0?[1-9]|1[0-2])\s*/\s*(?P<sy>19\d{{2}}|20\d{{2}})(?:{separator}(?:(?P<em>0?[1-9]|1[0-2])\s*/\s*)?(?P<ey>19\d{{2}}|20\d{{2}}|present|current)?)?",
         rf"(?P<sm>{month_name})\s+(?P<sy>19\d{{2}}|20\d{{2}}){separator}(?:(?P<em>{month_name})\s+)?(?P<ey>19\d{{2}}|20\d{{2}}|present|current)\b",
         rf"\b(?P<sy>19\d{{2}}|20\d{{2}}){separator}(?:(?P<em>{month_name})\s+)?(?P<ey>19\d{{2}}|20\d{{2}}|present|current)\b",
         rf"\b(?P<sy>19\d{{2}}|20\d{{2}})\s*(?:[–—-]\s*)?(?P<ey>present|current)\b",
@@ -258,7 +290,8 @@ def _split_work_title_company(value: str) -> tuple[str, str]:
 
 
 def _clean_work_chunk(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip(" -|,:;")
+    cleaned = re.sub(r"\s+", " ", value).strip(" -|,:;")
+    return re.sub(r"\s+\d{1,2}\s*/\s*$", "", cleaned).strip(" -|,:;")
 
 
 def _looks_like_geo_suffix(value: str) -> bool:

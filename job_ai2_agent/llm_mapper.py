@@ -1,5 +1,4 @@
-# File: /Users/victorbui/AI/Job_ai2/job_ai2_agent/llm_mapper.py
-from __future__ import annotations
+# job_ai2_agent/llm_mapper.py
 
 import json
 from dataclasses import asdict
@@ -143,7 +142,8 @@ def _best_match(field: ApplicationField, profile: dict[str, str]) -> tuple[str, 
         part for part in [field.label, field.name, field.placeholder, field.input_type] if part
     ).lower()
     aliases = {
-        "full_name": ("name", "full name", "legal name"),
+        "legal_name": ("legal name", "legal full name"),
+        "full_name": ("full name", "legal name"),
         "first_name": ("first name", "given name"),
         "last_name": ("last name", "family name", "surname"),
         "preferred_name": ("preferred name", "nickname", "chosen name"),
@@ -162,7 +162,8 @@ def _best_match(field: ApplicationField, profile: dict[str, str]) -> tuple[str, 
         "visa_sponsorship": ("sponsorship", "visa", "immigration sponsorship"),
         "desired_salary": ("salary", "compensation", "desired annual salary", "pay expectation"),
         "application_questions_notes": ("additional question", "application question", "notes", "other information"),
-        "ethnicity": ("ethnicity", "race", "hispanic", "latino"),
+        "ethnicity": ("ethnicity", "hispanic", "latino"),
+        "race": ("race", "racial identity"),
         "gender": ("gender", "sex"),
         "veteran_status": ("veteran", "protected veteran"),
         "disability_status": ("disability", "disabled"),

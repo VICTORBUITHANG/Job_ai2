@@ -1,11 +1,11 @@
-# File: /Users/victorbui/AI/Job_ai2/job_ai2_agent/browser_agent.py
-from __future__ import annotations
+# job_ai2_agent/browser_agent.py
 
 import re
 from asyncio import sleep
 from datetime import date
 from pathlib import Path
 from time import monotonic
+from urllib.parse import urlparse
 
 from job_ai2_agent.llm_mapper import FieldMapper
 from job_ai2_agent.models import AgentRunResult, ApplicationField, EducationItem, FillDecision, ResumeProfile, WorkExperience
@@ -24,14 +24,20 @@ async def fill_job_application(
 
     filled_count = 0
     skipped_count = 0
+    stopped_for_review = False
+    human_verification_required = False
     decisions: list[FillDecision] = []
+    application_url = _workday_fast_apply_url(job_url)
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=headless)
         page = await browser.new_page()
         page.set_default_timeout(10_000)
-        await page.goto(job_url, wait_until="domcontentloaded")
+        await page.goto(application_url, wait_until="domcontentloaded")
         await _quiet_wait(page)
+        if await _open_rippling_application(page):
+            application_url = page.url
+        is_rippling = _is_rippling_url(page.url)
 
         unavailable_message = await _workday_unavailable_message(page)
         if unavailable_message:
@@ -51,18 +57,26 @@ async def fill_job_application(
 
         uploaded = await _upload_resume_if_possible(page, resume_path)
         if uploaded:
-            await _quiet_wait(page)
-            await _wait_and_click_safe_next(page, timeout_ms=90_000)
+            if is_rippling:
+                await _wait_for_rippling_resume_ready(page, timeout_ms=8_000)
+            else:
+                await _wait_for_uploaded_file(page, resume_path, timeout_ms=60_000)
+                await _wait_and_click_safe_next(page, timeout_ms=30_000)
             await _quiet_wait(page)
 
         for _step in range(6):
             step_text = await _body_text(page)
-            special_decisions = await _fill_workday_known_fields(page, profile, resume_path)
+            if is_rippling:
+                special_decisions = await _fill_rippling_known_fields(page, profile)
+            else:
+                special_decisions = await _fill_workday_known_fields(page, profile, resume_path)
             decisions.extend(special_decisions)
             special_filled = sum(1 for decision in special_decisions if decision.action != "skip")
             filled_count += special_filled
             current_step_name = _current_workday_step_name(step_text)
             if current_step_name == "Review":
+                decisions.append(_manual_submit_review_decision())
+                stopped_for_review = True
                 break
             if current_step_name in {"My Information", "My Experience"}:
                 if not await _click_safe_next(page):
@@ -103,25 +117,214 @@ async def fill_job_application(
                 break
 
         screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-        await page.screenshot(path=str(screenshot_path), full_page=True)
+        if not stopped_for_review and _current_workday_step_name(await _body_text(page)) == "Review":
+            decisions.append(_manual_submit_review_decision())
+            stopped_for_review = True
+
+        human_verification_required = await _human_verification_required(page)
+        if human_verification_required:
+            decisions.append(_manual_human_verification_decision())
+            try:
+                await page.get_by_text("Verify you are human", exact=False).first.scroll_into_view_if_needed()
+            except Exception:
+                pass
+
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+        except Exception:
+            pass
 
         if hold_seconds > 0:
             try:
                 await page.wait_for_timeout(hold_seconds * 1000)
             except Exception:
                 pass
-        await browser.close()
+        try:
+            await browser.close()
+        except Exception:
+            pass
 
     result = AgentRunResult(
         status="completed",
-        job_url=job_url,
+        job_url=application_url,
         filled_count=filled_count,
         skipped_count=skipped_count,
         review_path="",
         screenshot_path=str(screenshot_path),
-        message="Filled available fields from the uploaded resume. Submit was not clicked.",
+        message=(
+            "Filled available fields. Complete the visible human verification, then review and submit."
+            if human_verification_required
+            else "Filled available fields and stopped before final submission for user review."
+        ),
     )
     return result, decisions
+
+
+def _workday_fast_apply_url(job_url):
+    return job_url.replace("/apply/autofillWithResume", "/apply/applyManually")
+
+
+def _is_rippling_job_detail_url(job_url):
+    parsed = urlparse(job_url)
+    path = parsed.path.rstrip("/")
+    return (
+        parsed.hostname == "ats.rippling.com"
+        and re.fullmatch(r"/[^/]+/jobs/[^/]+", path) is not None
+    )
+
+
+def _is_rippling_url(job_url):
+    return urlparse(job_url).hostname == "ats.rippling.com"
+
+
+async def _open_rippling_application(page):
+    if not _is_rippling_job_detail_url(page.url):
+        return False
+
+    selectors = [
+        "button:has-text('Apply now')",
+        "a:has-text('Apply now')",
+        "[role='button']:has-text('Apply now')",
+    ]
+    for selector in selectors:
+        candidates = page.locator(selector)
+        for index in range(await candidates.count()):
+            locator = candidates.nth(index)
+            try:
+                if not await locator.is_visible(timeout=2_000) or await _is_disabled(locator):
+                    continue
+                await _click_locator_with_mouse(page, locator)
+                try:
+                    await page.wait_for_url("**/apply?**", timeout=15_000)
+                except Exception:
+                    pass
+                await _quiet_wait(page)
+                return "/apply" in urlparse(page.url).path
+            except Exception:
+                continue
+    return False
+
+
+async def _fill_rippling_known_fields(page, profile):
+    fields = profile.fields
+    decisions = []
+    field_map = {
+        "[data-testid='input-first_name']": ("First name", fields.get("first_name", "")),
+        "[data-testid='input-last_name']": ("Last name", fields.get("last_name", "")),
+        "[data-testid='input-email']": ("Email", fields.get("email", "")),
+        "[data-testid='input-current_company']": ("Current company", fields.get("current_company", "")),
+        "[data-testid='input-phone_number']": ("Phone number", fields.get("phone", "")),
+    }
+    for selector, (label, value) in field_map.items():
+        decisions.append(await _fill_if_present(page, selector, label, value))
+    decisions.append(
+        FillDecision(
+            "[data-testid='input-linkedin_link']",
+            "LinkedIn Link",
+            "skip",
+            "",
+            1.0,
+            "Optional Rippling field intentionally left blank.",
+        )
+    )
+
+    decisions.append(await _fill_rippling_location(page, fields.get("location", "")))
+    dropdowns = [
+        ("Pronouns", fields.get("pronouns", "")),
+        ("Gender", fields.get("gender", "")),
+        ("Please identify your race", fields.get("race", "")),
+        ("Are you Hispanic/Latino?", fields.get("ethnicity", "")),
+        ("Veteran Status", fields.get("veteran_status", "")),
+        ("Disability Status", fields.get("disability_status", "")),
+    ]
+    for label, value in dropdowns:
+        decisions.append(await _choose_rippling_dropdown(page, label, value))
+    decisions.append(
+        await _choose_rippling_sms_consent(page, fields.get("sms_consent", "No"))
+    )
+    return decisions
+
+
+async def _fill_rippling_location(page, value):
+    selector = "[data-testid='input-undefined'][aria-label='textbox']"
+    if not value:
+        return FillDecision(selector, "Location", "skip", "", 0.0, "No saved location available.")
+    locator = page.locator(selector).first
+    try:
+        if not await locator.is_visible(timeout=1_000):
+            return FillDecision(selector, "Location", "skip", value, 0.0, "Rippling location field not visible.")
+        await locator.fill(value)
+        await page.wait_for_timeout(700)
+        await locator.press("ArrowDown")
+        await locator.press("Enter")
+        await page.wait_for_timeout(300)
+        return FillDecision(selector, "Location", "select", value, 0.9, "Selected Rippling location suggestion by keyboard.")
+    except Exception as exc:
+        return FillDecision(selector, "Location", "skip", value, 0.0, f"Could not select Rippling location: {exc}")
+
+
+async def _choose_rippling_dropdown(page, label, value):
+    if not value:
+        return FillDecision(f"dropdown near {label}", label, "skip", "", 0.0, "No saved profile value available.")
+    selector = await _mark_visible_control_after_text(page, label, "[role='combobox']")
+    if not selector:
+        return FillDecision(f"dropdown near {label}", label, "skip", value, 0.0, "Rippling dropdown not visible.")
+    dropdown = page.locator(selector).first
+    try:
+        await _click_locator_with_mouse(page, dropdown)
+        await page.wait_for_timeout(300)
+        if await _click_option_text(page, value) or await _click_option_text_fuzzy(page, value):
+            return FillDecision(selector, label, "select", value, 1.0, "Selected saved Rippling profile answer.")
+        await page.keyboard.press("Escape")
+        return FillDecision(selector, label, "skip", value, 0.0, "Saved value did not match a Rippling option.")
+    except Exception as exc:
+        return FillDecision(selector, label, "skip", value, 0.0, f"Could not select Rippling option: {exc}")
+
+
+async def _choose_rippling_sms_consent(page, value):
+    normalized = value.strip().lower()
+    wanted = "Yes - I consent to receiving text messages" if normalized == "yes" else "No - I do not consent to receiving text messages"
+    locator = page.get_by_text(wanted, exact=True).first
+    try:
+        if not await locator.is_visible(timeout=1_000):
+            return FillDecision("[name='sms_opt_in']", "SMS consent", "skip", value, 0.0, "SMS consent choice not visible.")
+        await _click_locator_with_mouse(page, locator)
+        return FillDecision("[name='sms_opt_in']", "SMS consent", "check", value, 1.0, "Selected saved SMS consent preference.")
+    except Exception as exc:
+        return FillDecision("[name='sms_opt_in']", "SMS consent", "skip", value, 0.0, f"Could not select SMS consent: {exc}")
+
+
+def _manual_submit_review_decision():
+    return FillDecision(
+        "button:has-text('Submit')",
+        "Workday Submit",
+        "skip",
+        "Submit",
+        1.0,
+        "Stopped on Workday Review so the user can review and click Submit.",
+    )
+
+
+async def _human_verification_required(page):
+    if "verify you are human" in (await _body_text(page)).lower():
+        return True
+    try:
+        return await page.locator(
+            "iframe[src*='challenges.cloudflare.com'], iframe[title*='Cloudflare'], iframe[title*='challenge']"
+        ).count() > 0
+    except Exception:
+        return False
+
+
+def _manual_human_verification_decision():
+    return FillDecision(
+        "text=/verify you are human/i",
+        "Human verification",
+        "skip",
+        "",
+        1.0,
+        "Cloudflare verification requires the user; browser remains open for completion.",
+    )
 
 
 async def _fill_workday_known_fields(
@@ -189,8 +392,6 @@ async def _fill_workday_my_information(
         )
     )
     field_map = {
-        "#name--legalName--firstName": ("First Name", fields.get("first_name", "")),
-        "#name--legalName--lastName": ("Last Name", fields.get("last_name", "")),
         "#address--addressLine1": ("Address Line 1", fields.get("address_line1", "")),
         "#address--addressLine2": ("Address Line 2", fields.get("address_line2", "")),
         "#address--city": ("City", fields.get("city", "")),
@@ -198,6 +399,22 @@ async def _fill_workday_my_information(
         "#emailAddress--emailAddress": ("Email", fields.get("email", "")),
         "#phoneNumber--phoneNumber": ("Phone Number", fields.get("phone", "")),
     }
+    decisions.append(
+        await _force_fill_if_present(
+            page,
+            "#name--legalName--firstName",
+            "First Name",
+            fields.get("first_name", ""),
+        )
+    )
+    decisions.append(
+        await _force_fill_if_present(
+            page,
+            "#name--legalName--lastName",
+            "Last Name",
+            fields.get("last_name", ""),
+        )
+    )
     for selector, (label, value) in field_map.items():
         decisions.append(await _fill_if_present(page, selector, label, value))
     if fields.get("preferred_name"):
@@ -251,6 +468,12 @@ async def _fill_workday_work_experience(
             currently_work_here=True,
         )
     ]
+    if experiences:
+        experiences[0].title = fields.get("current_job_title", "") or experiences[0].title
+        experiences[0].company = fields.get("current_company", "") or experiences[0].company
+        experiences[0].location = fields.get("current_job_location", "") or experiences[0].location
+        experiences[0].start_month = fields.get("current_job_start_month", "") or experiences[0].start_month
+        experiences[0].start_year = fields.get("current_job_start_year", "") or experiences[0].start_year
     experiences = [experience for experience in experiences if experience.title or experience.company]
     if not experiences:
         return decisions
@@ -521,23 +744,14 @@ async def _fill_workday_application_questions(
     fields = profile.fields
     text = await _body_text(page)
     if "desired start date" in text.lower():
+        desired_start_date = fields.get("desired_start_date", "") or _default_start_date()
         decisions.append(
-            await _fill_date_near_text(
-                page,
-                "desired start date",
-                "Desired Start Date",
-                fields.get("desired_start_date", "") or _default_start_date(),
-            )
+            await _fill_application_start_date(page, desired_start_date)
         )
     work_authorization = fields.get("work_authorization", "Yes") or "Yes"
     if "legally permitted" in text.lower():
         decisions.append(
-            await _choose_dropdown_near_text(
-                page,
-                "legally permitted to work",
-                [work_authorization],
-                "Legal Work Permission",
-            )
+            await _choose_application_work_authorization(page, work_authorization)
         )
     elif "authorized" in text.lower() or "work" in text.lower():
         decisions.append(await _choose_radio_near_text(page, "authorized", work_authorization, "work authorization"))
@@ -574,6 +788,60 @@ async def _fill_workday_application_questions(
             )
         )
     return decisions
+
+
+async def _fill_application_start_date(page, value):
+    decision = await _fill_date_near_text(
+        page,
+        "desired start date",
+        "Desired Start Date",
+        value,
+    )
+    if decision.action != "skip":
+        return decision
+    selector = await _mark_visible_control_after_text(
+        page,
+        "What is your desired start date?",
+        "input[placeholder='MM/DD/YYYY'], input",
+    )
+    if not selector:
+        return decision
+    try:
+        await _fill_text(page.locator(selector).first, value)
+        return FillDecision(selector, "Desired Start Date", "fill", value, 1.0, "Filled Workday desired start date field.")
+    except Exception as exc:
+        return FillDecision(selector, "Desired Start Date", "skip", value, 0.0, f"Could not fill desired start date: {exc}")
+
+
+async def _choose_application_work_authorization(page, value):
+    decision = await _choose_dropdown_near_text(
+        page,
+        "legally permitted to work",
+        [value],
+        "Legal Work Permission",
+    )
+    if decision.action != "skip":
+        return decision
+    selector = await _mark_visible_control_after_text(
+        page,
+        "Are you legally permitted to work in the country where this job is located?",
+        "button, [role='combobox']",
+    )
+    if not selector:
+        return decision
+    button = page.locator(selector).first
+    try:
+        if await _dropdown_has_value(button):
+            return FillDecision(selector, "Legal Work Permission", "skip", value, 1.0, "Already selected.")
+        await _click_locator_with_mouse(page, button)
+        await page.wait_for_timeout(500)
+        if await _click_option_text(page, value) or await _click_option_text_fuzzy(page, value):
+            return FillDecision(selector, "Legal Work Permission", "select", value, 1.0, "Selected Workday legal work permission.")
+        if await _type_dropdown_option(page, button, value):
+            return FillDecision(selector, "Legal Work Permission", "select", value, 0.9, "Selected Workday legal work permission by keyboard search.")
+        return FillDecision(selector, "Legal Work Permission", "skip", value, 0.0, "No legal work permission option matched.")
+    except Exception as exc:
+        return FillDecision(selector, "Legal Work Permission", "skip", value, 0.0, f"Could not select legal work permission: {exc}")
 
 
 async def _fill_workday_demographic_step(page, profile: ResumeProfile) -> list[FillDecision]:
@@ -625,7 +893,7 @@ async def _fill_workday_demographic_step(page, profile: ResumeProfile) -> list[F
                 page,
                 "Name",
                 "Disability Form Name",
-                fields.get("full_name", ""),
+                fields.get("legal_name", fields.get("full_name", "")),
             )
         )
         decisions.append(
@@ -699,7 +967,7 @@ async def _wait_for_workday_step_ready(page, timeout_ms: int = 90_000) -> None:
 
 async def _upload_resume_if_possible(page, resume_path: Path) -> bool:
     try:
-        await page.wait_for_selector("input[type='file'], button:has-text('Select file')", timeout=45_000)
+        await page.wait_for_selector("input[type='file']", timeout=45_000)
     except Exception:
         pass
 
@@ -712,28 +980,6 @@ async def _upload_resume_if_possible(page, resume_path: Path) -> bool:
                 return True
             except Exception:
                 continue
-
-    upload_triggers = [
-        "button:has-text('Upload')",
-        "button:has-text('Resume')",
-        "button:has-text('Autofill')",
-        "text=/upload resume/i",
-        "text=/select file/i",
-        "text=/select files/i",
-        "text=/choose file/i",
-    ]
-    for selector in upload_triggers:
-        trigger = page.locator(selector).first
-        try:
-            if not await trigger.is_visible(timeout=1_500):
-                continue
-            async with page.expect_file_chooser(timeout=3_000) as chooser_info:
-                await trigger.click()
-            chooser = await chooser_info.value
-            await chooser.set_files(str(resume_path))
-            return True
-        except Exception:
-            continue
     return False
 
 
@@ -764,30 +1010,7 @@ async def _upload_required_file_on_current_step(page, resume_path: Path) -> Fill
         except Exception:
             continue
 
-    trigger_selectors = [
-        "button:has-text('Select file')",
-        "button:has-text('Select File')",
-        "button:has-text('Upload')",
-        "text=/select file/i",
-        "text=/upload a file/i",
-        "text=/drop file here/i",
-    ]
-    for trigger_selector in trigger_selectors:
-        trigger = page.locator(trigger_selector).first
-        try:
-            if not await trigger.is_visible(timeout=1_000):
-                continue
-            async with page.expect_file_chooser(timeout=3_000) as chooser_info:
-                await trigger.click()
-            chooser = await chooser_info.value
-            await chooser.set_files(str(resume_path))
-            if await _wait_for_uploaded_file(page, resume_path, timeout_ms=30_000):
-                return FillDecision(trigger_selector, "Required resume upload", "upload", str(resume_path), 1.0, "Uploaded resume using Workday file chooser.")
-            return FillDecision(trigger_selector, "Required resume upload", "upload", str(resume_path), 0.7, "Set file chooser; no success text detected.")
-        except Exception:
-            continue
-
-    return FillDecision(selector, "Required resume upload", "skip", str(resume_path), 0.0, "No file upload control found on this step.")
+    return FillDecision(selector, "Required resume upload", "skip", str(resume_path), 0.0, "No file input found; skipped to avoid opening the system file picker.")
 
 
 async def _wait_for_uploaded_file(page, resume_path: Path, timeout_ms: int) -> bool:
@@ -796,6 +1019,20 @@ async def _wait_for_uploaded_file(page, resume_path: Path, timeout_ms: int) -> b
         if _resume_uploaded_on_page(await _body_text(page), resume_path):
             return True
         await page.wait_for_timeout(1_000)
+    return False
+
+
+async def _wait_for_rippling_resume_ready(page, timeout_ms):
+    deadline = monotonic() + (timeout_ms / 1000)
+    selector = "[data-testid='input-first_name']"
+    while monotonic() < deadline:
+        try:
+            value = await page.locator(selector).first.input_value(timeout=500)
+            if value.strip():
+                return True
+        except Exception:
+            pass
+        await page.wait_for_timeout(250)
     return False
 
 
@@ -1225,6 +1462,7 @@ async def _mark_visible_control_after_text(
             return text.includes(needle)
               && text.length < 300
               && !text.includes('back to job posting')
+              && !text.includes('error -')
               && !text.includes('errors found');
           });
           if (questionIndex < 0) return false;
